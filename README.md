@@ -26,6 +26,28 @@ Addressing the latency bottlenecks in traditional linear scan methods, this syst
 
 ## 🏗️ System Architecture
 
+```mermaid
+graph TD
+    subgraph Offline_Indexing ["Phase 1: Index Building (Offline)"]
+        A["Raw Vectors (SIFT-1M)"] -->|Input| B("K-Means Clustering")
+        B -->|Generate| C{"Centroids"}
+        B -->|Partition| D["Inverted Lists / Clusters"]
+        C -->|Serialize| E[("Index File")]
+        D -->|Serialize| E
+    end
+
+    subgraph Online_Query ["Phase 2: Vector Search"]
+        Q["Query Vector"] -->|Input| F("Centroid Search")
+        E -->|Load| F
+        F -->|SIMD Distance Calc| G["Top-N Closest Clusters"]
+        G -->|Pruning| H("Scan Vectors in Clusters")
+        H -->|SIMD Optimization| I["Top-K Nearest Neighbors"]
+    end
+
+    style F fill:#f9f,stroke:#333,stroke-width:2px,color:#000
+    style H fill:#f9f,stroke:#333,stroke-width:2px,color:#000
+    style B fill:#bbf,stroke:#333,stroke-width:2px,color:#000
+```
 ### 1. Index Structure (IVF_FLAT)
 The core architecture is built upon a centroid-based inverted index:
 * **Preprocessing:** K-means clustering is performed on the dataset (SIFT benchmark) to establish $K$ centroids.
@@ -40,7 +62,46 @@ To maximize hardware utilization, vector dimensions are processed in parallel la
 * **Tail Handling:** Efficiently processes remaining dimensions that do not fill a complete vector lane using a scalar fallback loop.
 
 ---
+## 👨‍💻 Implementation Highlights
 
+### SIMD-Accelerated Distance Calculation
+To maximize CPU throughput, we bypassed standard scalar loops and utilized the **Java Vector API (Incubator)**. This implementation processes multiple vector dimensions in parallel lanes within a single CPU cycle, leveraging hardware-specific SIMD instructions (e.g., AVX2, AVX-512).
+
+```java
+protected double calculateDistance(VectorConstant vec) {
+    // 1. Auto-detect optimal SIMD lane width for the current hardware
+    VectorSpecies<Float> species = FloatVector.SPECIES_PREFERRED;
+    
+    int i = 0;
+    double sum = 0;
+    float[] a_query = query.getVec();
+    float[] a_vec = vec.getVec();
+
+    // 2. Main SIMD Loop: Process 'species.length()' dimensions in parallel
+    for (; i < species.loopBound(vec.dimension()); i += species.length()) {
+        // Load vectors from memory into SIMD registers
+        FloatVector v_query = FloatVector.fromArray(species, a_query, i);
+        FloatVector v_vec = FloatVector.fromArray(species, a_vec, i);
+        
+        // Parallel subtraction and multiplication (Squared Euclidean)
+        FloatVector diff = v_query.sub(v_vec);
+        FloatVector diff_sqr = diff.mul(diff);
+
+        // Reduce vector lanes to a single scalar value
+        sum += diff_sqr.reduceLanes(VectorOperators.ADD);
+    }
+    
+    // 3. Tail Handling: Process remaining dimensions using scalar operations
+    for (; i < vec.dimension(); i++) {
+        double diff = a_query[i] - a_vec[i];
+        sum += diff * diff;
+    }
+
+    // Optimization: Return squared distance to avoid expensive sqrt()
+    return sum;
+}
+```
+---
 ## 🧪 Performance Benchmarks
 
 **Environment:** Intel Core i5-1135G7 @ 2.40GHz | 16GB RAM | SIFT-1M Benchmark
@@ -63,17 +124,28 @@ We analyzed the system performance by tuning two hyperparameters: **Cluster Coun
 
 ## 🚀 Getting Started
 
-### Prerequisites
-* JDK 17+ (with Incubator modules enabled for Vector API)
-* Maven / Gradle
+Since this project utilizes the **Java Vector API (Incubator)**, please ensure your environment supports JDK 17+ with preview features enabled.
 
-### Build & Run
+### 1. Prerequisite & Data Setup
+Download the SIFT-1M benchmark dataset and extract it to the data directory:
 ```bash
-# Clone the repository
-git clone [https://github.com/your-username/vector-db-project.git](https://github.com/your-username/vector-db-project.git)
+wget ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
+tar -zxvf sift.tar.gz -C ./data/
+```
+### 2. Configuration
+Configure the indexing parameters in config.json to tune the Recall/Throughput trade-off:
+```json
+{
+  "index_type": "IVF_FLAT",
+  "kmeans_clusters": 1600,   // Number of centroids (K)
+  "probe_count": 5,          // Number of clusters to search per query
+  "use_simd": true           // Enable vector acceleration
+}
+```
+### 3. Run Benchmark
+Execute the benchmark loader. The system will build the index and output QPS/Recall metrics:
+``` bash
+# Ensure --add-modules jdk.incubator.vector is set
+java --add-modules jdk.incubator.vector -jar target/vector-db.jar --config config.json
+```
 
-# Build the project
-mvn clean install
-
-# Run Benchmark (SIFT)
-java -jar target/vector-db.jar --benchmark
